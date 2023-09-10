@@ -1,0 +1,149 @@
+
+AWSTemplateFormatVersion: 2010-09-09
+
+
+Parameters:
+
+  DomainName:
+    Type: String
+
+  RefererValue:
+    Type: String
+    NoEcho: true
+
+
+Resources:
+
+  Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          -
+            Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+                - edgelambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        -
+          PolicyName: inline
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              -
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                Resource:
+                  - !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:*
+              -
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:*:*
+              -
+                Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                Resource:
+                  - !Sub arn:${AWS::Partition}:ssm:*:${AWS::AccountId}:parameter/*
+
+  Function:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: github-webhook-validating
+
+      PackageType: Zip
+      Code: ../src/github_webhook_validating/
+
+      Runtime: python3.11
+      Handler: lambda_function.lambda_handler
+      Architectures:
+        - x86_64
+      RuntimeManagementConfig:
+        UpdateRuntimeOn: Auto
+
+      MemorySize: 128
+      Timeout: 5
+
+      Role: !GetAtt Role.Arn
+
+  LambdaVersion:
+    Type: AWS::Lambda::Version
+    Properties:
+      FunctionName: !Ref Function
+
+  LambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref Function
+      Principal: replicator.lambda.amazonaws.com
+      Action: lambda:GetFunction
+
+
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    DependsOn:
+      - LambdaPermission
+    Properties:
+      DistributionConfig:
+        Enabled: true
+
+        Comment: GitHub Webhook
+        PriceClass: PriceClass_All
+        HttpVersion: http2and3
+        IPV6Enabled: true
+
+        Origins:
+          -
+            DomainName: !Ref DomainName
+
+            CustomOriginConfig:
+              OriginProtocolPolicy: https-only
+              HTTPSPort: 443
+              OriginSSLProtocols:
+                - TLSv1.2
+              OriginReadTimeout: 10
+              OriginKeepaliveTimeout: 60
+
+            Id: github-webhook
+
+            OriginCustomHeaders:
+              -
+                HeaderName: Referer
+                HeaderValue: !Ref RefererValue
+
+            OriginShield:
+              Enabled: false
+
+            ConnectionAttempts: 3
+            ConnectionTimeout: 10
+
+        DefaultCacheBehavior:
+          TargetOriginId: github-webhook
+          Compress: true
+
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+            - PUT
+            - POST
+            - PATCH
+            - DELETE
+
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad  # CachingDisabled
+          OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac  # AllViewerExceptHostHeader
+
+          LambdaFunctionAssociations:
+            -
+              EventType: viewer-request
+              LambdaFunctionARN: !Ref LambdaVersion
+              IncludeBody: true

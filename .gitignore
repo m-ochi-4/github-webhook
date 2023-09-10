@@ -1,0 +1,7 @@
+.tmp/
+.vscode/
+assets/*.bkp
+cfn/.build
+.env
+__pycache__
+*.pyc

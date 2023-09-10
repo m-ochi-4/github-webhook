@@ -1,0 +1,386 @@
+
+AWSTemplateFormatVersion: 2010-09-09
+
+
+Transform:
+  - AWS::Serverless-2016-10-31
+
+
+Parameters:
+
+  BucketName:
+    Type: String
+    AllowedPattern: ^[\-.0-9a-z]+$
+    MinLength: 3
+    MaxLength: 63
+
+  RefererValue:
+    Type: String
+    NoEcho: true
+
+
+Globals:
+
+  Function:
+
+    Runtime: python3.11
+    Handler: lambda_function.lambda_handler
+    Architectures:
+      - arm64
+
+
+Resources:
+
+  Topic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: github-webhook
+
+
+  Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          -
+            Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+                - firehose.amazonaws.com
+                - sns.amazonaws.com
+                - apigateway.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        -
+          PolicyName: inline
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              -
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                Resource:
+                  - !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:*
+              -
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*:*
+                  - !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/kinesisfirehose/*:*
+
+              # KinesisFirehoseServicePolicy
+              -
+                Effect: Allow
+                Action:
+                  - s3:AbortMultipartUpload
+                  - s3:GetBucketLocation
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:ListBucketMultipartUploads
+                  - s3:PutObject
+                Resource:
+                  - !Sub arn:aws:s3:::${BucketName}
+                  - !Sub arn:aws:s3:::${BucketName}/*
+              -
+                Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                  - lambda:GetFunctionConfiguration
+                Resource:
+                  - !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:github-webhook-kdf-partitioning:$LATEST
+
+              # SNS -> Firehose
+              -
+                Effect: Allow
+                Action:
+                  - firehose:PutRecord
+                Resource:
+                  - !Sub arn:${AWS::Partition}:firehose:${AWS::Region}:${AWS::AccountId}:deliverystream/PUT-S3-GITHUB-WEBHOOK
+
+              # API GW -> SNS
+              # Publicized Notification
+              -
+                Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource:
+                  - !Ref Topic
+                  - !Ref TopicNotificationPublicized
+
+
+  FunctionKdfPartitioning:
+    Type: AWS::Serverless::Function
+    Properties:
+
+      FunctionName: github-webhook-kdf-partitioning
+      CodeUri: ../src/github_webhook_kdf_partitioning/
+
+      MemorySize: 256
+      Timeout: 300
+
+      Role: !GetAtt Role.Arn
+
+  DeliveryStream:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    Properties:
+      DeliveryStreamType: DirectPut
+      DeliveryStreamName: PUT-S3-GITHUB-WEBHOOK
+
+      ExtendedS3DestinationConfiguration:
+
+        ProcessingConfiguration:
+          Enabled: true
+          Processors:
+            -
+              Type: Lambda
+              Parameters:
+                -
+                  ParameterName: LambdaArn
+                  ParameterValue: !Sub ${FunctionKdfPartitioning.Arn}:$LATEST
+                -
+                  ParameterName: BufferSizeInMBs
+                  ParameterValue: 3
+                -
+                  ParameterName: BufferIntervalInSeconds
+                  ParameterValue: 60
+            #-
+            #  Type: AppendDelimiterToRecord
+            #  Parameters: []
+
+        DataFormatConversionConfiguration:
+          Enabled: false
+
+        BucketARN: !Sub arn:aws:s3:::${BucketName}
+
+        DynamicPartitioningConfiguration:
+          Enabled: true
+          RetryOptions:
+            DurationInSeconds: 300
+
+        Prefix: kdf/PUT-S3-GITHUB-WEBHOOK/success/year=!{partitionKeyFromLambda:year}/month=!{partitionKeyFromLambda:month}/day=!{partitionKeyFromLambda:day}/hour=!{partitionKeyFromLambda:hour}/
+        ErrorOutputPrefix: kdf/PUT-S3-GITHUB-WEBHOOK/error/type=!{firehose:error-output-type}/year=!{timestamp:yyyy}/month=!{timestamp:MM}/day=!{timestamp:dd}/hour=!{timestamp:HH}/
+
+        BufferingHints:
+          SizeInMBs: 128
+          IntervalInSeconds: 300
+
+        CompressionFormat: GZIP
+
+        EncryptionConfiguration:
+          NoEncryptionConfig: NoEncryption
+
+        S3BackupMode: Disabled
+        #S3BackupConfiguration:
+
+        CloudWatchLoggingOptions:
+          Enabled: true
+          LogGroupName: /aws/kinesisfirehose/PUT-S3-GITHUB-WEBHOOK
+          LogStreamName: DestinationDelivery
+
+        RoleARN: !GetAtt Role.Arn
+
+      DeliveryStreamEncryptionConfigurationInput:
+        KeyType: AWS_OWNED_CMK
+
+  Subscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref Topic
+      Protocol: firehose
+      Endpoint: !GetAtt DeliveryStream.Arn
+      SubscriptionRoleArn: !GetAtt Role.Arn
+      RawMessageDelivery: true
+
+
+  TopicNotificationPublicized:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: github-webhook-notification-publicized
+
+  FunctionNotificationPublicized:
+    Type: AWS::Serverless::Function
+    Properties:
+
+      FunctionName: github-webhook-notification-publicized
+      CodeUri: ../src/github_webhook_notification_publicized/
+
+      MemorySize: 256
+      Timeout: 10
+
+      Role: !GetAtt Role.Arn
+
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref TopicNotificationPublicized
+
+      ReservedConcurrentExecutions: 1
+
+      Events:
+        SNSEvent:
+          Type: SNS
+          Properties:
+            Topic: !Ref Topic
+
+
+  Api:
+    Type: AWS::Serverless::Api
+    Properties:
+
+      # RestApi
+      Name: github-webhook
+      #Description:
+      EndpointConfiguration:
+        Type: REGIONAL
+        #VPCEndpointIds:
+        #  -
+      DisableExecuteApiEndpoint: false
+      ApiKeySourceType: HEADER
+      #MinimumCompressionSize:
+      #BinaryMediaTypes:
+
+      # Resource
+
+      Mode: overwrite
+      FailOnWarnings: false
+
+      #DefinitionUri:
+      #DefinitionBody:
+      #Cors:
+      #  AllowMethods:
+      #  AllowHeaders:
+      #  AllowOrigin:
+      #  MaxAge:
+      #  AllowCredentials: true
+
+      AlwaysDeploy: false
+      MergeDefinitions: false
+      #OpenApiVersion:
+
+      # Stage
+      StageName: prod
+
+      CacheClusterEnabled: false
+      #CacheClusterSize:
+
+      #AccessLogSetting:
+      #  DestinationArn:
+      #  Format:
+      TracingEnabled: false
+
+      #Variables:
+
+      #CanarySetting:
+      #  DeploymentId:
+      #  PercentTraffic:
+      #  UseStageCache: false
+      #  StageVariableOverrides:
+
+      MethodSettings:
+        -
+          ResourcePath: /*
+          HttpMethod: "*"
+
+          CachingEnabled: false
+          #CacheDataEncrypted: true
+          #CacheTtlInSeconds: 300
+
+          ThrottlingRateLimit: 10000
+          ThrottlingBurstLimit: 5000
+
+          LoggingLevel: ERROR
+          MetricsEnabled: false
+          DataTraceEnabled: false
+
+      Auth:
+        AddDefaultAuthorizerToCorsPreflight: true
+        AddApiKeyRequiredToCorsPreflight: true
+
+        #InvokeRole:
+        ApiKeyRequired: true
+
+        #Authorizers:
+        #DefaultAuthorizer:
+
+        ResourcePolicy:
+          CustomStatements: [
+            {
+              "Effect": "Deny",
+              "Principal": "*",
+              "Action": "execute-api:Invoke",
+              "Resource": "execute-api:/*/*/*",
+              "Condition": {
+                "StringNotEquals": {
+                  "aws:Referer": !Ref RefererValue
+                }
+              }
+            },
+            {
+              "Effect": "Allow",
+              "Principal": "*",
+              "Action": "execute-api:Invoke",
+              "Resource": "execute-api:/*/*/*",
+              "Condition": {
+                "StringEquals": {
+                  "aws:Referer": !Ref RefererValue
+                }
+              }
+            }
+          ]
+
+        UsagePlan:
+          CreateUsagePlan: PER_API
+          UsagePlanName: github-webhook
+          #Description:
+          #Throttle:
+          #  RateLimit:
+          #  BurstLimit:
+          #Quota:
+          #  Limit:
+          #  Offset:
+          #  Period:
+          #Tags:
+
+      #GatewayResponses:
+
+      #Models:
+
+      #Domain:
+
+      PropagateTags: true
+      #Tags:
+
+  FunctionApiGwAddHeader:
+    Type: AWS::Serverless::Function
+    Properties:
+
+      FunctionName: github-webhook-apigw-add-header
+      CodeUri: ../src/github_webhook_apigw_add_header/
+
+      MemorySize: 256
+      Timeout: 10
+
+      Role: !GetAtt Role.Arn
+
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref Topic
+
+      AutoPublishAlias: prod
+
+      DeploymentPreference:
+        Enabled: true
+        Type: AllAtOnce
+
+      Events:
+        ApiGw:
+          Type: Api
+          Properties:
+            RestApiId: !Ref Api
+            Path: /
+            Method: POST
